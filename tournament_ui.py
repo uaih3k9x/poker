@@ -18,6 +18,8 @@ Drop this next to main.py and the existing project files. It relies on your proj
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import json
 from pathlib import Path
 import importlib.util
 import inspect
@@ -27,12 +29,13 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
-from typing import List, Optional, Tuple
+from typing import List, Optional, TextIO, Tuple
 
 from logic import Game, Player, RandomPlayer, RockyPlayer
 
 BOTS_DIR = Path(__file__).with_name('bots')
 IMAGES_DIR = Path(__file__).with_name('images')
+LOGS_DIR = Path(__file__).with_name('tournament_logs')
 
 DEFAULT_MATCHES_PER_PAIR = 10
 DEFAULT_DELAY_MS = 250
@@ -69,6 +72,20 @@ class MatchTask:
     b: BotSpec
     series_index: int
     series_total: int
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    duration_ms: int
+    started_at: str
+    finished_at: str
+    winner: Optional[str] = None
+    loser: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec='milliseconds')
 
 
 def _safe_module_name(file: Path) -> str:
@@ -163,8 +180,9 @@ class TournamentUI:
         self.root = root
         self.root.title('Poker Bot Tournament')
         self.root.geometry('980x640')
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
-        self._result_queue: "queue.Queue[Tuple[MatchTask, Tuple[str, str] | Exception]]" = queue.Queue()
+        self._result_queue: "queue.Queue[Tuple[MatchTask, MatchResult]]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
         self._worker_lock = threading.Lock()
@@ -172,10 +190,14 @@ class TournamentUI:
         self._running = False
         self._pending_tasks: List[MatchTask] = []
         self._completed = 0
+        self._total_scheduled = 0
         self._bots: List[BotSpec] = []
         self._stats: dict[str, Stats] = {}
         self._matchup_stats: dict[str, dict[str, Stats]] = {}
         self._expanded_bots: set[str] = set()
+        self._log_file: Optional[TextIO] = None
+        self._log_path: Optional[Path] = None
+        self._run_id: Optional[str] = None
 
         self._avatar_cache: dict[str, tk.PhotoImage] = {}
         self._left_avatar: Optional[tk.PhotoImage] = None
@@ -304,6 +326,185 @@ class TournamentUI:
             return
         self.delay_label.config(text=str(v))
 
+    def _on_close(self) -> None:
+        self._running = False
+        self._worker_stop.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=0.5)
+        self._drain_result_queue(refresh_ui=False)
+        self._finalize_log(reason='closed')
+        self.root.destroy()
+
+    def _start_log(self) -> None:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self._run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        self._log_path = LOGS_DIR / f'tournament_{self._run_id}.jsonl'
+        self._log_file = self._log_path.open('a', encoding='utf-8')
+        self._log_event(
+            'tournament_started',
+            run_id=self._run_id,
+            scheduled_matches=self._total_scheduled,
+            bots=[{'name': b.name, 'image_path': b.image_path} for b in self._bots],
+            settings={
+                'matches_per_pair': int(self.matches_var.get()),
+                'delay_ms': int(float(self.delay_scale.get())),
+                'shuffle_matches': bool(self.shuffle_var.get()),
+                'include_builtins': bool(self.builtins_var.get()),
+                'step_batch': max(1, int(self.step_batch_var.get())),
+                'ui_update_every': max(1, int(self.update_every_var.get())),
+            },
+        )
+
+    def _log_event(self, event: str, **payload: object) -> None:
+        if self._log_file is None:
+            return
+        record = {
+            'ts': _now_iso(),
+            'event': event,
+            **payload,
+        }
+        json.dump(record, self._log_file, ensure_ascii=False)
+        self._log_file.write('\n')
+        self._log_file.flush()
+
+    def _close_log(self) -> None:
+        if self._log_file is not None:
+            self._log_file.close()
+        self._log_file = None
+        self._log_path = None
+        self._run_id = None
+
+    def _stats_snapshot(self, name: str, stats: Stats) -> dict[str, object]:
+        return {
+            'name': name,
+            'played': stats.played,
+            'wins': stats.wins,
+            'losses': stats.losses,
+            'win_rate': round(stats.win_rate, 6),
+            'win_pct': round(stats.win_rate * 100, 2),
+        }
+
+    def _matchup_snapshot(self, opponent: str, stats: Stats) -> dict[str, object]:
+        return {
+            'opponent': opponent,
+            'played': stats.played,
+            'wins': stats.wins,
+            'losses': stats.losses,
+            'win_rate': round(stats.win_rate, 6),
+            'win_pct': round(stats.win_rate * 100, 2),
+        }
+
+    def _standings_snapshot(self) -> List[dict[str, object]]:
+        ordered = sorted(
+            self._stats.items(),
+            key=lambda kv: (kv[1].wins, kv[1].win_rate, kv[0]),
+            reverse=True,
+        )
+        return [
+            {
+                'rank': idx,
+                **self._stats_snapshot(name, stats),
+            }
+            for idx, (name, stats) in enumerate(ordered, start=1)
+        ]
+
+    def _matchups_snapshot(self) -> dict[str, List[dict[str, object]]]:
+        return {
+            bot_name: [
+                self._matchup_snapshot(opponent, stats)
+                for opponent, stats in sorted(opponents.items())
+            ]
+            for bot_name, opponents in sorted(self._matchup_stats.items())
+        }
+
+    def _finalize_log(self, reason: str) -> None:
+        if self._log_file is None:
+            return
+        event = 'tournament_finished' if reason == 'finished' else 'tournament_interrupted'
+        self._log_event(
+            event,
+            run_id=self._run_id,
+            reason=reason,
+            completed_matches=self._completed,
+            scheduled_matches=self._total_scheduled,
+            remaining_matches=max(0, self._total_scheduled - self._completed),
+            leader=self._leader_name(),
+            standings=self._standings_snapshot(),
+            matchups=self._matchups_snapshot(),
+        )
+        self._close_log()
+
+    def _consume_result(self, task: MatchTask, result: MatchResult) -> None:
+        self._completed += 1
+        common_payload = {
+            'run_id': self._run_id,
+            'match_index': self._completed,
+            'scheduled_matches': self._total_scheduled,
+            'remaining_matches': max(0, self._total_scheduled - self._completed),
+            'bot_a': task.a.name,
+            'bot_b': task.b.name,
+            'series_index': task.series_index,
+            'series_total': task.series_total,
+            'started_at': result.started_at,
+            'finished_at': result.finished_at,
+            'duration_ms': result.duration_ms,
+        }
+
+        if result.error is not None:
+            self._stats[task.a.name].losses += 1
+            self._stats[task.b.name].losses += 1
+            self._matchup_stats[task.a.name][task.b.name].losses += 1
+            self._matchup_stats[task.b.name][task.a.name].losses += 1
+            self.status.config(text=f'Match error ({task.a.name} vs {task.b.name}): {result.error}')
+            self._log_event(
+                'match_error',
+                **common_payload,
+                error=result.error,
+            )
+            return
+
+        winner = result.winner or ''
+        loser = result.loser or ''
+        self._stats[winner].wins += 1
+        self._stats[loser].losses += 1
+        self._matchup_stats[winner][loser].wins += 1
+        self._matchup_stats[loser][winner].losses += 1
+        self._log_event(
+            'match_completed',
+            **common_payload,
+            winner=winner,
+            loser=loser,
+            leader=self._leader_name(),
+            winner_totals=self._stats_snapshot(winner, self._stats[winner]),
+            loser_totals=self._stats_snapshot(loser, self._stats[loser]),
+            winner_vs_loser=self._matchup_snapshot(loser, self._matchup_stats[winner][loser]),
+            loser_vs_winner=self._matchup_snapshot(winner, self._matchup_stats[loser][winner]),
+        )
+
+    def _drain_result_queue(self, refresh_ui: bool) -> bool:
+        updated = False
+        update_every = max(1, int(self.update_every_var.get()))
+        local_count = 0
+
+        try:
+            while True:
+                task, result = self._result_queue.get_nowait()
+                self._consume_result(task, result)
+                updated = True
+                local_count += 1
+
+                if refresh_ui and local_count >= update_every:
+                    self._refresh_table()
+                    self._update_status_line(final=False)
+                    local_count = 0
+        except queue.Empty:
+            pass
+
+        if refresh_ui and updated and local_count > 0:
+            self._refresh_table()
+            self._update_status_line(final=False)
+        return updated
+
     def _reset_tournament(self) -> None:
         self._running = False
         self.play_btn.config(text='Play')
@@ -311,12 +512,15 @@ class TournamentUI:
         self._worker_stop.set()
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=0.2)
+        self._drain_result_queue(refresh_ui=False)
+        self._finalize_log(reason='reset')
 
         self._bots = load_bots(BOTS_DIR, include_builtins=self.builtins_var.get())
         if len(self._bots) < 2:
             self._pending_tasks = []
             self._stats = {}
             self._matchup_stats = {}
+            self._total_scheduled = 0
             self._expanded_bots.clear()
             self._refresh_table()
             self.status.config(text=f'Found {len(self._bots)} bot(s). Add at least 2 into {BOTS_DIR}.')
@@ -336,6 +540,8 @@ class TournamentUI:
         shuffle = bool(self.shuffle_var.get())
         self._pending_tasks = build_round_robin(self._bots, matches_per_pair, shuffle)
         self._completed = 0
+        self._total_scheduled = len(self._pending_tasks)
+        self._start_log()
 
         self._avatar_cache.clear()
         self._left_avatar = None
@@ -360,12 +566,31 @@ class TournamentUI:
 
                     task = self._pending_tasks.pop(0)
                     self.root.after(0, lambda t=task: self._set_current_match(t))
+                    started_at = _now_iso()
+                    started_clock = time.perf_counter()
 
                     try:
-                        outcome = play_match(task.a, task.b)
-                        self._result_queue.put((task, outcome))
+                        winner, loser = play_match(task.a, task.b)
+                        self._result_queue.put((
+                            task,
+                            MatchResult(
+                                winner=winner,
+                                loser=loser,
+                                duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                                started_at=started_at,
+                                finished_at=_now_iso(),
+                            ),
+                        ))
                     except Exception as e:
-                        self._result_queue.put((task, e))
+                        self._result_queue.put((
+                            task,
+                            MatchResult(
+                                error=f'{type(e).__name__}: {e}',
+                                duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                                started_at=started_at,
+                                finished_at=_now_iso(),
+                            ),
+                        ))
 
                     processed += 1
 
@@ -401,41 +626,7 @@ class TournamentUI:
         self._start_worker(batch_size=batch)
 
     def _poll_results(self) -> None:
-        updated = False
-        update_every = max(1, int(self.update_every_var.get()))
-        local_count = 0
-
-        try:
-            while True:
-                task, payload = self._result_queue.get_nowait()
-                self._completed += 1
-                local_count += 1
-                updated = True
-
-                if isinstance(payload, Exception):
-                    self._stats[task.a.name].losses += 1
-                    self._stats[task.b.name].losses += 1
-                    self._matchup_stats[task.a.name][task.b.name].losses += 1
-                    self._matchup_stats[task.b.name][task.a.name].losses += 1
-                    self.status.config(text=f'Match error ({task.a.name} vs {task.b.name}): {payload}')
-                else:
-                    winner, loser = payload
-                    self._stats[winner].wins += 1
-                    self._stats[loser].losses += 1
-                    self._matchup_stats[winner][loser].wins += 1
-                    self._matchup_stats[loser][winner].losses += 1
-
-                if local_count >= update_every:
-                    self._refresh_table()
-                    self._update_status_line(final=False)
-                    local_count = 0
-
-        except queue.Empty:
-            pass
-
-        if updated and local_count > 0:
-            self._refresh_table()
-            self._update_status_line(final=False)
+        updated = self._drain_result_queue(refresh_ui=True)
 
         if not self._pending_tasks and self._worker and not self._worker.is_alive():
             self._finish()
@@ -447,6 +638,7 @@ class TournamentUI:
         self.play_btn.config(text='Play')
         self._set_current_match(None)
         self._update_status_line(final=True)
+        self._finalize_log(reason='finished')
 
     def _refresh_table(self) -> None:
         open_states: dict[str, bool] = {}
@@ -568,7 +760,7 @@ class TournamentUI:
             return None
 
     def _update_status_line(self, final: bool) -> None:
-        total = self._completed + len(self._pending_tasks)
+        total = self._total_scheduled
         if total == 0:
             self.status.config(text='')
             return
