@@ -1,4 +1,3 @@
-# Your code here
 from collections import Counter
 from multiprocessing import Pool, cpu_count
 import random
