@@ -15,7 +15,7 @@ MATCHES = 1000
 PARALLEL = False
 
 class MyPlayer(Player):
-    name = 'Name your bot/Team name'
+    name = 'Default Name 3'
     image_path = 'images/your_image.png' # Optional
 
     def get_hand_type(self, community_cards: list[str]) -> HandRank:
