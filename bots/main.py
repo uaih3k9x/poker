@@ -15,9 +15,9 @@ RANK_VALUES = {rank: value for value, rank in enumerate("23456789TJQKA", start=2
 AGGRESSIVE_MOVES = {Move.BET, Move.RAISE, Move.ALL_IN}
 ALL_CARDS = tuple(rank + suit for suit in "dhsc" for rank in "23456789TJQKA")
 
-# Project Azalea
+
 class MyPlayer(Player):
-    name = "Default Name 3"
+    name = "AzaleaV2"
     image_path = "images/Azalea.jpg"
 
     @staticmethod
