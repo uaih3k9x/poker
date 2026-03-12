@@ -14,7 +14,7 @@ MATCHES = 1000
 PARALLEL = False
 
 class MyPlayer(Player):
-    name = 'Default Name 3'
+    name = 'Default Name 3 v4'
     image_path = 'images/your_image.png'
 
     def __init__(self):

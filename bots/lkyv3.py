@@ -14,22 +14,12 @@ MATCHES = 1000
 PARALLEL = False
 
 class MyPlayer(Player):
-    name = 'Default Name 3'
+    name = 'Default Name 3 v3'
     image_path = 'images/your_image.png'
 
     def __init__(self):
         super().__init__()
         self._is_button = False
-        # Cross-street pot tracking
-        self._carried_pot = 0
-        self._last_board_len = 0
-        self._last_round_history = []
-        # Opponent action stats (cross-hand)
-        self._opp_actions = {
-            'preflop_open': 0, 'preflop_opp': 0,
-            'postflop_bet': 0, 'postflop_opp': 0,
-            'allin': 0, 'showdown': 0
-        }
 
     # ── Utility ──────────────────────────────────────────────
 
@@ -66,22 +56,6 @@ class MyPlayer(Player):
 
     # ── State extraction from round_history ──────────────────
 
-    def _sync_street_state(self, community_cards, round_history):
-        """Sync carried pot when entering a new street."""
-        board_len = len(community_cards)
-        if board_len != self._last_board_len:
-            # New street: carry over previous street's commitments (if any existed)
-            if self._last_round_history:
-                prev_my, prev_opp = self.commitments(self._last_round_history)
-                self._carried_pot += prev_my + prev_opp
-            self._last_board_len = board_len
-        self._last_round_history = list(round_history)
-
-    def real_pot(self, round_history):
-        """Get true pot = carried + current street commitments."""
-        my_c, opp_c = self.commitments(round_history)
-        return self._carried_pot + my_c + opp_c
-
     def commitments(self, round_history: list[tuple[Move, int]]) -> tuple[int, int]:
         """Extract (my_commitment, opp_commitment) from round_history."""
         my_commitment, opp_commitment = 0, 0
@@ -94,6 +68,11 @@ class MyPlayer(Player):
                     opp_commitment = amount
             actor_is_me = not actor_is_me
         return my_commitment, opp_commitment
+
+    def estimate_pot(self, community_cards: list[str], my_commitment: int, opp_commitment: int) -> int:
+        """Estimate total pot = previous streets baseline + current street commitments."""
+        baseline = 0 if not community_cards else 200 + max(0, len(community_cards) - 3) * 50
+        return baseline + my_commitment + opp_commitment
 
     def opponent_aggression_count(self, round_history: list[tuple[Move, int]]) -> int:
         """Count only opponent's aggressive actions this street."""
@@ -194,53 +173,6 @@ class MyPlayer(Player):
         overpair = hole_ranks[0] == hole_ranks[1] and hole_ranks[0] > top_board
         top_pair = any(r == top_board for r in hole_ranks)
         return overpair, top_pair
-
-    def board_texture(self, community_cards: list[str]) -> dict:
-        """Return board texture flags for exploitation."""
-        if not community_cards:
-            return {'paired': False, 'two_tone': False, 'monotone': False,
-                    'connected': False, 'high_card': False, 'dangerous': False}
-        suits = [c[1] for c in community_cards]
-        ranks = [RANK_VALUES[c[0]] for c in community_cards]
-        suit_counts = Counter(suits)
-        rank_counts = Counter(ranks)
-
-        paired = any(c >= 2 for c in rank_counts.values())
-        monotone = len(set(suits)) == 1
-        two_tone = not monotone and len(set(suits)) == 2 and max(suit_counts.values()) >= len(community_cards) - 1
-        high_card = max(ranks) >= 12  # A or K high
-        connected = max(ranks) - min(ranks) <= 4 and len(set(ranks)) >= 3
-
-        # Dangerous: 4-flush or 4-straight possible
-        dangerous = max(suit_counts.values()) >= 4
-        if not dangerous:
-            rank_set = set(ranks)
-            if 14 in rank_set:
-                rank_set.add(1)
-            for start in range(1, 11):
-                needed = set(range(start, start + 5))
-                if len(needed & rank_set) >= 4:
-                    dangerous = True
-                    break
-
-        return {'paired': paired, 'two_tone': two_tone, 'monotone': monotone,
-                'connected': connected, 'high_card': high_card, 'dangerous': dangerous}
-
-    def effective_bb(self, max_bet: int) -> float:
-        """Calculate effective stack in big blinds."""
-        my_stack = self.chips + self.pot_commitment
-        opp_stack = max_bet
-        effective = min(my_stack, opp_stack)
-        return effective / BIG_BLIND
-
-    def stack_regime(self, max_bet: int) -> str:
-        """Return 'deep', 'medium', or 'short' stack regime."""
-        bb = self.effective_bb(max_bet)
-        if bb < 15:
-            return 'short'
-        elif bb < 40:
-            return 'medium'
-        return 'deep'
 
     # ── Preflop ──────────────────────────────────────────────
 
@@ -354,12 +286,6 @@ class MyPlayer(Player):
             if strong_draw and len(community_cards) < 5:
                 call_threshold -= 0.05
 
-            # pair_flags bonus for calling
-            if overpair:
-                call_threshold -= 0.04
-            elif top_pair and not facing_heat:
-                call_threshold -= 0.02
-
             max_call_amount = max(900, int(max_bet * 0.25))
             if equity >= call_threshold and to_call <= max_call_amount and Move.CALL in valid_moves:
                 return Move.CALL
@@ -371,22 +297,15 @@ class MyPlayer(Player):
             return Move.CHECK if Move.CHECK in valid_moves else Move.FOLD
 
         # === Acting first (to_call == 0) ===
-        # Apply pair_flags bonus for active betting
-        effective_equity = equity
-        if overpair:
-            effective_equity += 0.05
-        elif top_pair:
-            effective_equity += 0.03
-
         if self._is_button:
             # IP: wider c-bet, smaller sizing
-            if effective_equity >= 0.66:
+            if equity >= 0.66:
                 return self.aggressive_action(valid_moves, min_bet, max_bet,
                                               max(min_bet, int(pot * 0.70)), Move.CHECK)
-            if effective_equity >= 0.50:
+            if equity >= 0.50:
                 return self.aggressive_action(valid_moves, min_bet, max_bet,
                                               max(min_bet, int(pot * 0.50)), Move.CHECK)
-            if len(community_cards) == 3 and effective_equity >= 0.38:
+            if len(community_cards) == 3 and equity >= 0.38:
                 return self.aggressive_action(valid_moves, min_bet, max_bet,
                                               max(min_bet, int(pot * 0.35)), Move.CHECK)
             if strong_draw and len(community_cards) < 5 and not opp_loose:
@@ -394,10 +313,10 @@ class MyPlayer(Player):
                                               max(min_bet, int(pot * 0.40)), Move.CHECK)
         else:
             # OOP: tighter thresholds
-            if effective_equity >= 0.70:
+            if equity >= 0.70:
                 return self.aggressive_action(valid_moves, min_bet, max_bet,
                                               max(min_bet, int(pot * 0.75)), Move.CHECK)
-            if effective_equity >= 0.58:
+            if equity >= 0.58:
                 return self.aggressive_action(valid_moves, min_bet, max_bet,
                                               max(min_bet, int(pot * 0.55)), Move.CHECK)
             if strong_draw and len(community_cards) < 5 and not opp_loose:
@@ -409,30 +328,15 @@ class MyPlayer(Player):
     # ── Main entry ───────────────────────────────────────────
 
     def move(self, community_cards, valid_moves, round_history, min_bet, max_bet):
-        # Detect new hand: transitioned from river (5 cards) to preflop (0 cards)
-        if not community_cards and self._last_board_len == 5:
-            self._carried_pot = 0
-            self._last_board_len = 0
-            self._last_round_history = []
-            self._is_button = self.pot_commitment <= 50
-        # First action of very first hand (initialization case)
-        elif not community_cards and self._carried_pot == 0 and self._last_board_len == 0:
-            self._is_button = self.pot_commitment <= 50
-
-        # Sync street state (detect street transitions within a hand)
-        self._sync_street_state(community_cards, round_history)
-
         my_commitment, opp_commitment = self.commitments(round_history)
         to_call = max(0, opp_commitment - my_commitment)
-
-        # Use estimate_pot for now (safer baseline)
-        if community_cards:
-            pot = 200 + max(0, len(community_cards) - 3) * 50 + my_commitment + opp_commitment
-        else:
-            pot = my_commitment + opp_commitment
+        pot = self.estimate_pot(community_cards, my_commitment, opp_commitment)
         pot_odds = to_call / (pot + to_call) if to_call > 0 else 0.0
 
         if not community_cards:
+            # Detect position only on first preflop action
+            if len(round_history) <= 3:
+                self._is_button = self.pot_commitment <= 50
             return self.preflop_move(valid_moves, min_bet, max_bet, to_call, pot_odds, round_history)
 
         return self.postflop_move(community_cards, valid_moves, round_history,
@@ -440,7 +344,7 @@ class MyPlayer(Player):
 
 def run_match(_: int) -> str:
     """Run a single match and return the winner's name."""
-    p1, p2 = MyPlayer(), RandomPlayer()
+    p1, p2 = MyPlayer(), RockyPlayer()
     game = Game(p1, p2, debug=False)
     return game.simulate_hands().name
 
